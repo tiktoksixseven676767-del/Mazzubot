@@ -1,80 +1,139 @@
+process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '1';
+import './config.js';
+import { createRequire } from 'module';
+import path, { join } from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+import { platform } from 'process';
+import fs, { readdirSync, statSync, unlinkSync, existsSync, mkdirSync, rmSync, watch } from 'fs';
+import yargs from 'yargs';
+import { spawn } from 'child_process';
+import lodash from 'lodash';
+import chalk from 'chalk';
+import syntaxerror from 'syntax-error';
+import { format } from 'util';
+import pino from 'pino';
+import { makeWASocket, protoType, serialize } from './lib/simple.js';
+import storeHelper from './lib/store.js';
+import { Low, JSONFile } from 'lowdb';
+import readline from 'readline';
+import NodeCache from 'node-cache';
+
+// --- CONFIGURAZIONE CARTELLE ---
+const authFolder = 'session_auth'; // Cartella standard Mazzubot
+const sessionFolder = path.join(process.cwd(), authFolder);
+const tempDir = join(process.cwd(), 'temp');
+if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
+
 const { 
-    default: makeWASocket, 
     useMultiFileAuthState, 
-    delay, 
+    fetchLatestBaileysVersion, 
     makeCacheableSignalKeyStore, 
+    Browsers, 
+    jidNormalizedUser, 
     DisconnectReason 
-} = require('@whiskeysockets/baileys')
-const pino = require('pino')
-const readline = require('readline')
-const fs = require('fs')
-const path = require('path')
+} = await import('@whiskeysockets/baileys');
 
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-const question = (text) => new Promise((resolve) => rl.question(text, resolve))
+const { chain } = lodash;
+protoType();
+serialize();
 
-async function startMazzuBot() {
-    const { state, saveCreds } = await useMultiFileAuthState('session_auth')
-
-    const sock = makeWASocket({
-        auth: {
-            creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })),
-        },
-        printQRInTerminal: false,
-        logger: pino({ level: 'fatal' }),
-        browser: ["Ubuntu", "Chrome", "20.0.04"]
-    })
-
-    // --- LOGICA DI COLLEGAMENTO ---
-    if (!sock.authState.creds.registered) {
-        console.log("--- CONFIGURAZIONE MAZZUBOT ---")
-        const phoneNumber = await question('Inserisci il numero (es. 39333...): ')
-        
-        console.log("⏳ Attendo 10 secondi per stabilizzare la connessione...")
-        await delay(10000) // Il delay per evitare l'errore 428
-        
-        try {
-            const code = await sock.requestPairingCode(phoneNumber.trim())
-            console.log(`\n✅ CODICE DI COLLEGAMENTO: ${code}\n`)
-        } catch (err) {
-            console.error("Errore nel pairing. Riprova tra poco.", err)
-        }
-    }
-
-    sock.ev.on('creds.update', saveCreds)
-
-    // --- CARICAMENTO PLUGIN ---
-    sock.ev.on('messages.upsert', async m => {
-        const msg = m.messages[0]
-        if (!msg.message || msg.key.fromMe) return
-        
-        const body = msg.message.conversation || msg.message.extendedTextMessage?.text || ""
-        if (!body.startsWith('.')) return
-
-        const command = body.slice(1).trim().split(' ').shift().toLowerCase()
-        const args = body.trim().split(/ +/).slice(1)
-
-        const pluginFolder = path.join(__dirname, 'plugins')
-        if (fs.existsSync(pluginFolder)) {
-            const pluginFiles = fs.readdirSync(pluginFolder).filter(file => file.endsWith('.js'))
-            for (const file of pluginFiles) {
-                const plugin = require(path.join(pluginFolder, file))
-                if (plugin.commands.includes(command)) {
-                    await plugin.run(sock, msg, { args, command, body })
-                }
-            }
-        }
-    })
-
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update
-        if (connection === 'open') console.log('✨ Mazzubot ONLINE!')
-        if (connection === 'close') {
-            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut
-            if (shouldReconnect) startMazzuBot()
-        }
-    })
+// --- FUNZIONI DI LOG ---
+function logMazzu(message, color = 'cyanBright') {
+    const printer = chalk[color] || chalk.cyanBright;
+    console.log(printer(`[ MAZZUBOT ] ${message}`));
 }
 
-startMazzuBot()
+// --- DATABASE ---
+global.db = new Low(new JSONFile('database.json'));
+global.loadDatabase = async function loadDatabase() {
+    if (global.db.data !== null) return;
+    await global.db.read().catch(console.error);
+    global.db.data = { users: {}, chats: {}, stats: {}, msgs: {}, sticker: {}, settings: {}, ...(global.db.data || {}) };
+    global.db.chain = chain(global.db.data);
+};
+loadDatabase();
+
+// --- SETUP CONNESSIONE ---
+const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+const { version } = await fetchLatestBaileysVersion();
+let rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+const question = (t) => new Promise((resolver) => rl.question(t, (r) => resolver(r.trim())));
+
+async function startMazzuBot() {
+    const logger = pino({ level: 'silent' });
+    
+    const connectionOptions = {
+        logger,
+        printQRInTerminal: !process.argv.includes("code"),
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger),
+        },
+        browser: Browsers.ubuntu("Chrome"),
+        version,
+        getMessage: async (key) => { return undefined; }
+    };
+
+    global.conn = makeWASocket(connectionOptions);
+
+    // --- LOGICA PAIRING CODE (Solo se non c'è sessione) ---
+    if (!conn.authState.creds.registered && process.argv.includes("code")) {
+        const phoneNumber = await question(chalk.bold.magenta('\nInserisci il numero di telefono (es. 39333...):\n> '));
+        const code = await conn.requestPairingCode(phoneNumber.replace(/\D/g, ''));
+        console.log(chalk.black.bgCyan('\n ꒰ 🚀 ꒱ CODICE DI COLLEGAMENTO: '), chalk.bold.white(code.match(/.{1,4}/g).join('-')), '\n');
+    }
+
+    // --- GESTORE EVENTI ---
+    conn.ev.on('creds.update', saveCreds);
+    
+    conn.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+        
+        if (qr) logMazzu("Scansiona il QR Code per connetterti!", "yellowBright");
+        
+        if (connection === 'connecting') logMazzu("Connessione in corso...", "blueBright");
+        
+        if (connection === 'open') {
+            logMazzu(`Connesso con successo come ${conn.user.name || 'Mazzubot'}`, "greenBright");
+        }
+
+        if (connection === 'close') {
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            logMazzu(`Connessione chiusa. Ragione: ${reason}`, "redBright");
+            if (reason !== DisconnectReason.loggedOut) startMazzuBot();
+        }
+    });
+
+    await global.reloadHandler();
+}
+
+// --- RELOAD HANDLER & PLUGINS ---
+global.reloadHandler = async function (restatConn) {
+    let handler = await import(`./handler.js?update=${Date.now()}`);
+    conn.handler = handler.handler.bind(global.conn);
+    conn.ev.on('messages.upsert', conn.handler);
+    return true;
+};
+
+const pluginFolder = join(global.__dirname(import.meta.url), 'plugins');
+global.plugins = {};
+
+async function loadPlugins() {
+    const files = readdirSync(pluginFolder).filter(file => file.endsWith('.js'));
+    for (const file of files) {
+        try {
+            const module = await import(pathToFileURL(join(pluginFolder, file)).href);
+            global.plugins[file] = module.default || module;
+        } catch (e) {
+            console.error(`Errore caricamento plugin ${file}:`, e);
+        }
+    }
+}
+
+// Inizializzazione
+global.__filename = function(pathURL = import.meta.url) { return fileURLToPath(pathURL); };
+global.__dirname = function(pathURL) { return path.dirname(global.__filename(pathURL)); };
+
+loadPlugins();
+startMazzuBot();
