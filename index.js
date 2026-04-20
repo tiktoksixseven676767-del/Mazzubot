@@ -1,21 +1,14 @@
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    delay, 
-    makeCacheableSignalKeyStore,
-    DisconnectReason
-} = require('@whiskeysockets/baileys')
+const { default: makeWASocket, useMultiFileAuthState, delay, makeCacheableSignalKeyStore, DisconnectReason } = require('@whiskeysockets/baileys')
 const pino = require('pino')
 const readline = require('readline')
-const { exec } = require('child_process')
+const fs = require('fs')
+const path = require('path')
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
 const question = (text) => new Promise((resolve) => rl.question(text, resolve))
 
 async function startMazzuBot() {
-    // Gestione della sessione (cartella session_auth)
     const { state, saveCreds } = await useMultiFileAuthState('session_auth')
-
     const sock = makeWASocket({
         auth: {
             creds: state.creds,
@@ -23,77 +16,55 @@ async function startMazzuBot() {
         },
         printQRInTerminal: false,
         logger: pino({ level: 'fatal' }),
-        browser: ["Ubuntu", "Chrome", "20.0.04"] // Aiuta a evitare blocchi
+        browser: ["Ubuntu", "Chrome", "20.0.04"]
     })
 
-    // Richiesta Pairing Code (8 caratteri)
     if (!sock.authState.creds.registered) {
         console.log("--- CONFIGURAZIONE MAZZUBOT ---")
-        const phoneNumber = await question('Inserisci il numero di telefono (es. 393331234567): ')
-        
-        await delay(3000) // Ritardo di sicurezza per evitare l'errore 428
-        try {
-            const code = await sock.requestPairingCode(phoneNumber.trim())
-            console.log(`\n✅ IL TUO CODICE DI COLLEGAMENTO: ${code}\n`)
-            console.log("Apri WhatsApp -> Dispositivi collegati -> Collega con numero di telefono\n")
-        } catch (err) {
-            console.error("Errore nella generazione del codice. Riprova tra un minuto.", err)
-        }
+        const phoneNumber = await question('Inserisci il numero (es. 39333...): ')
+        await delay(3000)
+        const code = await sock.requestPairingCode(phoneNumber.trim())
+        console.log(`\n✅ CODICE DI COLLEGAMENTO: ${code}\n`)
     }
 
-    // Salvataggio credenziali
     sock.ev.on('creds.update', saveCreds)
 
-    // Gestione connessione
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect } = update
-        if (connection === 'open') {
-            console.log('✨ Mazzubot connesso con successo!')
-        }
-        if (connection === 'close') {
-            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut
-            console.log('Connessione chiusa. Riconnessione in corso...', shouldReconnect)
-            if (shouldReconnect) startMazzuBot()
-        }
-    })
-
-    // Gestione Messaggi e Comandi
     sock.ev.on('messages.upsert', async m => {
         const msg = m.messages[0]
         if (!msg.message || msg.key.fromMe) return
-
+        
         const body = msg.message.conversation || msg.message.extendedTextMessage?.text || ""
-        const from = msg.key.remoteJid
         const prefix = "."
         
         if (!body.startsWith(prefix)) return
-        
+
         const command = body.slice(prefix.length).trim().split(' ').shift().toLowerCase()
+        const args = body.trim().split(/ +/).slice(1)
 
-        switch (command) {
-            case 'menu':
-                const menuText = `
-🤖 *MAZZUBOT MENU* 🤖
+        // Caricamento dinamico dei plugin
+        const pluginFolder = path.join(__dirname, 'plugins')
+        if (!fs.existsSync(pluginFolder)) fs.mkdirSync(pluginFolder)
+        
+        const pluginFiles = fs.readdirSync(pluginFolder).filter(file => file.endsWith('.js'))
 
-Ciao *${msg.pushName || 'utente'}*!
-Ecco cosa posso fare:
+        for (const file of pluginFiles) {
+            const plugin = require(path.join(pluginFolder, file))
+            if (plugin.commands.includes(command)) {
+                try {
+                    await plugin.run(sock, msg, { args, command, body })
+                } catch (e) {
+                    console.error(`Errore nel plugin ${file}:`, e)
+                }
+            }
+        }
+    })
 
-* ${prefix}menu - Mostra questa lista
-* ${prefix}aggiorna - Scarica novità da GitHub
-
-_Versione 1.0.0_
-                `.trim()
-                await sock.sendMessage(from, { text: menuText })
-                break
-
-            case 'aggiorna':
-                await sock.sendMessage(from, { text: "🔄 Aggiornamento in corso..." })
-                exec('git pull', (err, stdout) => {
-                    if (err) return sock.sendMessage(from, { text: `❌ Errore: ${err.message}` })
-                    sock.sendMessage(from, { text: `✅ Aggiornato!\n${stdout}\nIl bot si riavvia...` })
-                    process.exit()
-                })
-                break
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update
+        if (connection === 'open') console.log('✨ Mazzubot è ONLINE!')
+        if (connection === 'close') {
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut
+            if (shouldReconnect) startMazzuBot()
         }
     })
 }
