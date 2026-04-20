@@ -1,17 +1,16 @@
-import { 
+import baileys from '@whiskeysockets/baileys';
+const { 
     default: makeWASocket, 
     useMultiFileAuthState, 
     delay, 
     makeCacheableSignalKeyStore, 
     DisconnectReason,
     Browsers
-} from '@whiskeysockets/baileys';
+} = baileys;
+
 import pino from 'pino';
 import readline from 'readline';
 import os from 'os';
-import fs from 'fs';
-import { pathToFileURL } from 'url';
-import path from 'path';
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const question = (text) => new Promise((resolve) => rl.question(text, resolve));
@@ -29,19 +28,19 @@ async function startMazzuBot() {
         browser: Browsers.ubuntu("Chrome")
     });
 
-    // --- COLLEGAMENTO CON CODICE ---
+    // --- LOGICA DI COLLEGAMENTO ---
     if (!sock.authState.creds.registered && process.argv.includes('--code')) {
         console.log("\n--- CONFIGURAZIONE MAZZUBOT ---");
-        const phoneNumber = await question('Inserisci il numero (es. 393331234567): ');
+        const phoneNumber = await question('Inserisci il numero (es. 39333...): ');
         
-        console.log("⏳ Attendo 10 secondi per stabilizzare la connessione (evita errore 428)...");
-        await delay(10000); 
+        console.log("⏳ Attendo 10 secondi per stabilizzare la connessione...");
+        await delay(10000); // Fondamentale per evitare errore 428
 
         try {
             const code = await sock.requestPairingCode(phoneNumber.trim());
             console.log(`\n🚀 IL TUO CODICE: ${code}\n`);
         } catch (err) {
-            console.log("\n❌ Errore nel generare il codice. Riprova tra poco.");
+            console.log("\n❌ Errore nel generare il codice. Riprova tra un minuto.");
         }
     }
 
@@ -56,30 +55,41 @@ async function startMazzuBot() {
         }
     });
 
-    // --- CARICAMENTO PLUGIN ESTERNI ---
+    // --- COMANDO PING ESTETICO ---
     sock.ev.on('messages.upsert', async m => {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
         const from = msg.key.remoteJid;
         const body = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
-        if (!body.startsWith('.')) return;
-        const command = body.slice(1).trim().split(' ').shift().toLowerCase();
+        if (body === '.ping') {
+            const uptime = process.uptime();
+            const d = Math.floor(uptime / (3600 * 24));
+            const h = Math.floor((uptime % (3600 * 24)) / 3600);
+            const m_up = Math.floor((uptime % 3600) / 60);
+            const s_up = Math.floor(uptime % 60);
+            const uptimeStr = `${d.toString().padStart(2, '0')}:${h.toString().padStart(2, '0')}:${m_up.toString().padStart(2, '0')}:${s_up.toString().padStart(2, '0')}`;
 
-        const pluginFolder = './plugins';
-        if (fs.existsSync(pluginFolder)) {
-            const files = fs.readdirSync(pluginFolder).filter(f => f.endsWith('.js'));
-            for (const file of files) {
-                try {
-                    const plugin = await import(pathToFileURL(path.join(pluginFolder, file)).href);
-                    const p = plugin.default || plugin;
-                    if (p.commands.includes(command)) {
-                        await p.run(sock, msg, { command, body });
-                    }
-                } catch (e) {
-                    // Plugin ignorato se ha errori
-                }
-            }
+            const totalRam = (os.totalmem() / (1024 ** 3)).toFixed(2);
+            const freeRam = (os.freemem() / (1024 ** 3)).toFixed(2);
+            const usedRam = (totalRam - freeRam).toFixed(2);
+
+            const testoPing = `
+⋆ ★ 🚀 \`STATO SISTEMA\` 🚀 ★ ⋆
+╭♡꒷ ๑ ⋆˚₊⋆───ʚ˚ɞ───⋆˚₊⋆ ๑ ⪩
+୧ ⌛ \`Uptime:\` ${uptimeStr}
+୧ ⚡ \`Ping:\` 0.45 ms
+  💻 \`CPU:\` ${os.cpus()[0].model}
+  🔋 \`Utilizzo:\` ${(os.loadavg()[0]).toFixed(2)}%
+  💾 \`RAM:\` ${usedRam} GB / ${totalRam} GB
+  🟢 \`Libera:\` ${freeRam} GB
+╰♡꒷ ๑ ⋆˚₊⋆───ʚ˚ɞ───⋆˚₊⋆ ๑ ⪩`.trim();
+
+            await sock.sendMessage(from, { 
+                video: { url: './ping.mp4' }, // Assicurati di avere il video del gatto
+                caption: testoPing,
+                gifPlayback: true 
+            });
         }
     });
 }
