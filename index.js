@@ -1,139 +1,87 @@
-process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '1';
-import './config.js';
-import { createRequire } from 'module';
-import path, { join } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-import { platform } from 'process';
-import fs, { readdirSync, statSync, unlinkSync, existsSync, mkdirSync, rmSync, watch } from 'fs';
-import yargs from 'yargs';
-import { spawn } from 'child_process';
-import lodash from 'lodash';
-import chalk from 'chalk';
-import syntaxerror from 'syntax-error';
-import { format } from 'util';
-import pino from 'pino';
-import { makeWASocket, protoType, serialize } from './lib/simple.js';
-import storeHelper from './lib/store.js';
-import { Low, JSONFile } from 'lowdb';
-import readline from 'readline';
-import NodeCache from 'node-cache';
-
-// --- CONFIGURAZIONE CARTELLE ---
-const authFolder = 'session_auth'; // Cartella standard Mazzubot
-const sessionFolder = path.join(process.cwd(), authFolder);
-const tempDir = join(process.cwd(), 'temp');
-if (!existsSync(tempDir)) mkdirSync(tempDir, { recursive: true });
-
-const { 
+import { 
+    default: makeWASocket, 
     useMultiFileAuthState, 
-    fetchLatestBaileysVersion, 
+    delay, 
     makeCacheableSignalKeyStore, 
-    Browsers, 
-    jidNormalizedUser, 
-    DisconnectReason 
-} = await import('@whiskeysockets/baileys');
+    DisconnectReason,
+    Browsers
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import readline from 'readline';
+import os from 'os';
+import fs from 'fs';
+import { pathToFileURL } from 'url';
+import path from 'path';
 
-const { chain } = lodash;
-protoType();
-serialize();
-
-// --- FUNZIONI DI LOG ---
-function logMazzu(message, color = 'cyanBright') {
-    const printer = chalk[color] || chalk.cyanBright;
-    console.log(printer(`[ MAZZUBOT ] ${message}`));
-}
-
-// --- DATABASE ---
-global.db = new Low(new JSONFile('database.json'));
-global.loadDatabase = async function loadDatabase() {
-    if (global.db.data !== null) return;
-    await global.db.read().catch(console.error);
-    global.db.data = { users: {}, chats: {}, stats: {}, msgs: {}, sticker: {}, settings: {}, ...(global.db.data || {}) };
-    global.db.chain = chain(global.db.data);
-};
-loadDatabase();
-
-// --- SETUP CONNESSIONE ---
-const { state, saveCreds } = await useMultiFileAuthState(authFolder);
-const { version } = await fetchLatestBaileysVersion();
-let rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-
-const question = (t) => new Promise((resolver) => rl.question(t, (r) => resolver(r.trim())));
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+const question = (text) => new Promise((resolve) => rl.question(text, resolve));
 
 async function startMazzuBot() {
-    const logger = pino({ level: 'silent' });
-    
-    const connectionOptions = {
-        logger,
-        printQRInTerminal: !process.argv.includes("code"),
+    const { state, saveCreds } = await useMultiFileAuthState('session_auth');
+
+    const sock = makeWASocket({
         auth: {
             creds: state.creds,
-            keys: makeCacheableSignalKeyStore(state.keys, logger),
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'fatal' })),
         },
-        browser: Browsers.ubuntu("Chrome"),
-        version,
-        getMessage: async (key) => { return undefined; }
-    };
+        printQRInTerminal: !process.argv.includes('--code'),
+        logger: pino({ level: 'fatal' }),
+        browser: Browsers.ubuntu("Chrome")
+    });
 
-    global.conn = makeWASocket(connectionOptions);
+    // --- COLLEGAMENTO CON CODICE ---
+    if (!sock.authState.creds.registered && process.argv.includes('--code')) {
+        console.log("\n--- CONFIGURAZIONE MAZZUBOT ---");
+        const phoneNumber = await question('Inserisci il numero (es. 393331234567): ');
+        
+        console.log("⏳ Attendo 10 secondi per stabilizzare la connessione (evita errore 428)...");
+        await delay(10000); 
 
-    // --- LOGICA PAIRING CODE (Solo se non c'è sessione) ---
-    if (!conn.authState.creds.registered && process.argv.includes("code")) {
-        const phoneNumber = await question(chalk.bold.magenta('\nInserisci il numero di telefono (es. 39333...):\n> '));
-        const code = await conn.requestPairingCode(phoneNumber.replace(/\D/g, ''));
-        console.log(chalk.black.bgCyan('\n ꒰ 🚀 ꒱ CODICE DI COLLEGAMENTO: '), chalk.bold.white(code.match(/.{1,4}/g).join('-')), '\n');
+        try {
+            const code = await sock.requestPairingCode(phoneNumber.trim());
+            console.log(`\n🚀 IL TUO CODICE: ${code}\n`);
+        } catch (err) {
+            console.log("\n❌ Errore nel generare il codice. Riprova tra poco.");
+        }
     }
 
-    // --- GESTORE EVENTI ---
-    conn.ev.on('creds.update', saveCreds);
-    
-    conn.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        
-        if (qr) logMazzu("Scansiona il QR Code per connetterti!", "yellowBright");
-        
-        if (connection === 'connecting') logMazzu("Connessione in corso...", "blueBright");
-        
-        if (connection === 'open') {
-            logMazzu(`Connesso con successo come ${conn.user.name || 'Mazzubot'}`, "greenBright");
-        }
+    sock.ev.on('creds.update', saveCreds);
 
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'open') console.log('\n✨ Mazzubot ONLINE!');
         if (connection === 'close') {
-            const reason = lastDisconnect?.error?.output?.statusCode;
-            logMazzu(`Connessione chiusa. Ragione: ${reason}`, "redBright");
-            if (reason !== DisconnectReason.loggedOut) startMazzuBot();
+            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) startMazzuBot();
         }
     });
 
-    await global.reloadHandler();
-}
+    // --- CARICAMENTO PLUGIN ESTERNI ---
+    sock.ev.on('messages.upsert', async m => {
+        const msg = m.messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+        const from = msg.key.remoteJid;
+        const body = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
 
-// --- RELOAD HANDLER & PLUGINS ---
-global.reloadHandler = async function (restatConn) {
-    let handler = await import(`./handler.js?update=${Date.now()}`);
-    conn.handler = handler.handler.bind(global.conn);
-    conn.ev.on('messages.upsert', conn.handler);
-    return true;
-};
+        if (!body.startsWith('.')) return;
+        const command = body.slice(1).trim().split(' ').shift().toLowerCase();
 
-const pluginFolder = join(global.__dirname(import.meta.url), 'plugins');
-global.plugins = {};
-
-async function loadPlugins() {
-    const files = readdirSync(pluginFolder).filter(file => file.endsWith('.js'));
-    for (const file of files) {
-        try {
-            const module = await import(pathToFileURL(join(pluginFolder, file)).href);
-            global.plugins[file] = module.default || module;
-        } catch (e) {
-            console.error(`Errore caricamento plugin ${file}:`, e);
+        const pluginFolder = './plugins';
+        if (fs.existsSync(pluginFolder)) {
+            const files = fs.readdirSync(pluginFolder).filter(f => f.endsWith('.js'));
+            for (const file of files) {
+                try {
+                    const plugin = await import(pathToFileURL(path.join(pluginFolder, file)).href);
+                    const p = plugin.default || plugin;
+                    if (p.commands.includes(command)) {
+                        await p.run(sock, msg, { command, body });
+                    }
+                } catch (e) {
+                    // Plugin ignorato se ha errori
+                }
+            }
         }
-    }
+    });
 }
 
-// Inizializzazione
-global.__filename = function(pathURL = import.meta.url) { return fileURLToPath(pathURL); };
-global.__dirname = function(pathURL) { return path.dirname(global.__filename(pathURL)); };
-
-loadPlugins();
 startMazzuBot();
