@@ -18,18 +18,20 @@ async function startMazzuBot() {
         browser: Browsers.ubuntu("Chrome")
     });
 
+    // --- COLLEGAMENTO ---
     if (!sock.authState.creds.registered && process.argv.includes('--code')) {
         console.log("\n--- CONFIGURAZIONE MAZZUBOT ---");
-        const phoneNumber = await question('Inserisci il numero: ');
-        await delay(10000); 
+        const phoneNumber = await question('Inserisci il numero (es. 39333...): ');
+        await delay(10000); // Evita errore 428
         try {
             const code = await sock.requestPairingCode(phoneNumber.trim());
-            console.log(`\n🚀 CODICE: ${code}\n`);
-        } catch (err) { console.log("\n❌ Errore pairing."); }
+            console.log(`\n🚀 CODICE DA INSERIRE: ${code}\n`);
+        } catch (err) { console.log("\n❌ Errore. Riprova tra un minuto."); }
     }
 
     sock.ev.on('creds.update', saveCreds);
 
+    // --- LOADER PLUGIN ---
     sock.ev.on('messages.upsert', async m => {
         const msg = m.messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -37,17 +39,13 @@ async function startMazzuBot() {
         if (!body.startsWith('.')) return;
 
         const command = body.slice(1).trim().split(' ').shift().toLowerCase();
-        const pluginFolder = './plugins';
-        
-        if (fs.existsSync(pluginFolder)) {
-            const files = fs.readdirSync(pluginFolder).filter(f => f.endsWith('.js'));
-            for (const file of files) {
-                const plugin = await import(pathToFileURL(path.join(pluginFolder, file)).href);
-                const p = plugin.default || plugin;
-                if (p.commands.includes(command)) {
-                    await p.run(sock, msg);
-                }
-            }
+        const pluginPath = path.join(process.cwd(), 'plugins', `${command}.js`);
+
+        if (fs.existsSync(pluginPath)) {
+            try {
+                const plugin = await import(pathToFileURL(pluginPath).href);
+                await plugin.default.run(sock, msg);
+            } catch (e) { console.error(`Errore nel plugin ${command}:`, e); }
         }
     });
 
